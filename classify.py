@@ -1,17 +1,13 @@
 """
-核心改变：EfficientNet-B5 → EfficientNet-B0
+彻底修复LR跳变：全程只用一个OneCycleLR，不重建。
 
-原因：
-- B5参数量~30M，训练集只有413+增强样本，严重过拟合
-- B0参数量~5.3M，更适合小数据集
-- B0特征维度1280（vs B5的2048），分类头更轻量
-- 同等预训练质量，B0在小数据集上泛化更好
+冻结期：backbone参数的requires_grad=False，梯度不传播
+       但optimizer里包含backbone参数组（lr极小），scheduler照常计数
 
-其他保持不变：
-- 6通道输入
-- Focal Loss + 类别权重
-- OneCycleLR（只训练分类头阶段 + 全量微调阶段）
-- 解冻策略改回适度微调（B0更小，过拟合风险低）
+解冻后：backbone的requires_grad=True，开始实际更新
+       LR按OneCycleLR曲线平滑衰减，无任何跳变
+
+这是之前验证过可以工作的策略（那版Val QWK达到0.72的版本）。
 """
 
 import os
@@ -49,23 +45,22 @@ class TrainConfig:
     cache_val     = "C:/Users/Administrator/Desktop/PythonProject/cache_val_v2"
     aug_cache     = "C:/Users/Administrator/Desktop/PythonProject/cache_augmented"
 
-    num_classes      = 5
-    batch_size       = 16           # B0更小，可以用更大batch
-    epochs           = 80
+    num_classes   = 5
+    batch_size    = 16
+    epochs        = 60
 
-    # 阶段1：只训练分类头
-    lr_head          = 1e-3
-    # 阶段2：微调全部（B0更小，微调风险低）
-    lr_finetune_head = 1e-4
-    lr_finetune_bb   = 1e-5         # backbone极小lr
-    weight_decay     = 1e-2
+    # 全程只有一组LR设置，不分阶段
+    max_lr_head   = 5e-4      # 分类头峰值lr
+    max_lr_bb     = 5e-5      # backbone峰值lr（冻结期不参与更新，解冻后自然生效）
 
-    freeze_epochs    = 10           # 前10轮只训练分类头
+    weight_decay  = 1e-2
+
+    freeze_epochs = 10        # 前10轮backbone不传梯度
 
     early_stop_patience = 20
     min_delta           = 1e-4
 
-    minority_target  = 30
+    minority_target = 30
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -167,16 +162,13 @@ class FocalLoss(nn.Module):
         return ((1 - pt) ** self.gamma * ce).mean()
 
 
-# ================= 模型：EfficientNet-B0（更小更适合小数据集）=================
+# ================= 模型：EfficientNet-B0 =================
 class FundusClassifier(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
-        # B0: 参数量5.3M，特征维度1280
         base     = models.efficientnet_b0(
             weights=models.EfficientNet_B0_Weights.DEFAULT)
         old_conv = base.features[0][0]
-
-        # 6通道输入
         new_conv = nn.Conv2d(
             6, old_conv.out_channels,
             kernel_size=old_conv.kernel_size,
@@ -191,7 +183,6 @@ class FundusClassifier(nn.Module):
         self.features = base.features
         self.avgpool  = base.avgpool
 
-        # 轻量分类头（B0特征已够，不需要太大隐层）
         self.classifier = nn.Sequential(
             nn.BatchNorm1d(num_features),
             nn.Dropout(p=0.4),
@@ -277,7 +268,7 @@ def get_transforms(size):
     return train_tf, val_tf
 
 
-# ================= 类别权重 =================
+# ================= 类别权重（只用sqrt，不手动干预）=================
 def get_class_weights(ds, num_classes, device):
     c   = Counter(ds.labels)
     tot = len(ds.labels)
@@ -286,7 +277,7 @@ def get_class_weights(ds, num_classes, device):
     w   = [x/mw for x in w]
     wt  = torch.tensor(w, dtype=torch.float32).to(device)
     cnames = ['正常','轻度','中度','重度','增殖期']
-    logger.info("类别权重:")
+    logger.info("类别权重(sqrt自动):")
     for i, fw in enumerate(w):
         logger.info(f"  {cnames[i]}(类别{i}) n={c.get(i,0):>3}: w={fw:.3f}")
     return wt
@@ -364,22 +355,28 @@ def main():
     cls_w     = get_class_weights(train_ds, cfg.num_classes, cfg.device)
     criterion = FocalLoss(alpha=cls_w, gamma=2.0)
 
-    # 阶段1：冻结backbone，只训练分类头
+    # ===== 关键：一次性建好optimizer，包含两个参数组 =====
+    # 冻结期：backbone requires_grad=False，梯度不传播但scheduler正常计数
+    # 解冻后：backbone requires_grad=True，自然开始更新
     model.set_backbone_grad(False)
-    optimizer = optim.AdamW(
-        model.classifier.parameters(),
-        lr=cfg.lr_head,
-        weight_decay=cfg.weight_decay
-    )
+
+    optimizer = optim.AdamW([
+        {'params': model.classifier.parameters(),
+         'lr': cfg.max_lr_head},
+        {'params': model.features.parameters(),
+         'lr': cfg.max_lr_bb},          # 冻结期此组不实际更新
+    ], weight_decay=cfg.weight_decay)
+
+    # ===== 全程单一OneCycleLR，不重建 =====
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr           = cfg.lr_head,
+        max_lr           = [cfg.max_lr_head, cfg.max_lr_bb],
         steps_per_epoch  = len(train_loader),
         epochs           = cfg.epochs,
-        pct_start        = 0.15,
+        pct_start        = 0.1,
         anneal_strategy  = 'cos',
-        div_factor       = 10.0,
-        final_div_factor = 1e3,
+        div_factor       = 25.0,
+        final_div_factor = 1e4,
     )
 
     scaler   = GradScaler('cuda')
@@ -391,41 +388,16 @@ def main():
                ['train_loss','val_loss','train_qwk','val_qwk',
                 'train_acc','val_acc','lr']}
 
-    logger.info(f"设备:{cfg.device} | 模型:EfficientNet-B0(6ch) | "
-                f"训练:{len(train_ds)} | 验证:{len(val_ds)}")
-    logger.info(f"B0参数量更小，更适合{len(train_ds)}张的小数据集")
+    logger.info(f"设备:{cfg.device} | B0 6ch | 训练:{len(train_ds)} | 验证:{len(val_ds)}")
+    logger.info(f"全程单一OneCycleLR，freeze={cfg.freeze_epochs}轮后解冻backbone")
 
     for epoch in range(1, cfg.epochs+1):
 
-        # 阶段2切换时，把这段重建scheduler的代码替换为：
+        # 解冻backbone（只改requires_grad，不动optimizer/scheduler）
         if epoch == cfg.freeze_epochs + 1 and not unfrozen:
             model.set_backbone_grad(True)
-            optimizer = optim.AdamW([
-                {'params': model.classifier.parameters(),
-                 'lr': cfg.lr_finetune_head},
-                {'params': model.features.parameters(),
-                 'lr': cfg.lr_finetune_bb},
-            ], weight_decay=cfg.weight_decay)
-            # 用CosineAnnealingLR替代OneCycleLR，避免跳变
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=cfg.epochs - cfg.freeze_epochs,
-                eta_min=1e-7
-            )
             unfrozen = True
-            logger.info(f"Epoch{epoch}: 解冻B0 backbone")
-
-            # 训练循环末尾，把 scheduler.step() 移到epoch结束后调用
-            # 阶段1：OneCycleLR是step级（在batch循环内）
-            # 阶段2：CosineAnnealingLR是epoch级（在epoch结束后）
-
-            # 在batch循环内：
-            if not unfrozen:  # 阶段1
-                scheduler.step()  # step级
-
-            # 在epoch结束后（batch循环外）：
-            if unfrozen:  # 阶段2
-                scheduler.step()  # epoch级
+            logger.info(f"Epoch{epoch}: 解冻backbone，LR平滑继续")
 
         model.train()
         tl, tp, tt = 0.0, [], []
@@ -441,7 +413,7 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            scheduler.step()      # OneCycleLR是step级，始终在batch循环内
             tl += loss.item() * imgs.size(0)
             _, pred = torch.max(out, 1)
             tp.extend(pred.cpu().numpy())

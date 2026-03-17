@@ -45,7 +45,7 @@ class FundusClassifier(nn.Module):
             stride=old_conv.stride,
             padding=old_conv.padding, bias=False)
         base.features[0][0] = new_conv
-        num_features  = base.classifier[1].in_features  # 1280
+        num_features  = base.classifier[1].in_features
         self.features = base.features
         self.avgpool  = base.avgpool
         hidden = 256
