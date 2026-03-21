@@ -63,8 +63,8 @@ class TrainConfig:
     epochs         = 60
 
     max_lr_img     = 5e-4   # 图像流学习率
-    max_lr_mask    = 1e-3   # mask流学习率（从头训练，需要更大lr）
-    weight_decay   = 1e-2
+    max_lr_mask    = 3e-4   # mask流学习率（从头训练，需要更大lr）
+    weight_decay   = 2e-2
 
     freeze_img_epochs = 10  # 前10轮冻结图像流backbone
 
