@@ -60,7 +60,7 @@ class TrainConfig:
 
     max_lr_head   = 5e-4
     max_lr_bb     = 5e-5
-    weight_decay  = 1e-2
+    weight_decay  =2e-2
     freeze_epochs = 10
 
     early_stop_patience = 15
@@ -355,7 +355,7 @@ class FundusClassifier(nn.Module):
             nn.Linear(num_features, 256),
             nn.ReLU(inplace=True),
             nn.BatchNorm1d(256),
-            nn.Dropout(p=0.35),
+            nn.Dropout(p=0.3),
             nn.Linear(256, num_classes),
         )
 
@@ -459,8 +459,6 @@ def get_class_weights(ds, num_classes, device):
     w   = [(tot / c.get(i,1)) ** 0.5 for i in range(num_classes)]
     mw  = sum(w) / len(w)
     w   = [x/mw for x in w]
-    w[3] = w[3] * 2.0  # 重度专项提权，15.8%太低
-    w[1] = w[1] * 1.5  # 轻度也适当提
     wt  = torch.tensor(w, dtype=torch.float32).to(device)
     cnames = ['正常','轻度','中度','重度','增殖期']
     logger.info("类别权重:")
