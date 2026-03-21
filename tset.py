@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout
                              QWidget, QPushButton, QComboBox, QLabel, QMessageBox)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 
+
 #test pycharm git
 # 串口通讯后台线程
 class SerialWorker(QThread):
