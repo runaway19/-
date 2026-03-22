@@ -62,11 +62,11 @@ class TrainConfig:
     batch_size     = 16
     epochs         = 100
 
-    max_lr_img     = 5e-4   # 图像流学习率
-    max_lr_mask    = 3e-4   # mask流学习率（从头训练，需要更大lr）
+    max_lr_img     =1e-3   # 图像流学习率
+    max_lr_mask    =5e-4   # mask流学习率（从头训练，需要更大lr）
     weight_decay   = 2e-2
 
-    freeze_img_epochs = 15  # 前10轮冻结图像流backbone
+    freeze_img_epochs = 9999  # 前10轮冻结图像流backbone
 
     early_stop_patience = 20
     min_delta           = 1e-4
@@ -515,10 +515,10 @@ def main():
 
     for epoch in range(1, cfg.epochs+1):
 
-        if epoch == cfg.freeze_img_epochs + 1 and not unfrozen:
-            model.set_img_backbone_grad(True)
-            unfrozen = True
-            logger.info(f"Epoch{epoch}: 解冻图像流backbone")
+#        if epoch == cfg.freeze_img_epochs + 1 and not unfrozen:
+#            model.set_img_backbone_grad(True)
+#            unfrozen = True
+#            logger.info(f"Epoch{epoch}: 解冻图像流backbone")
 
         model.train()
         tl, tp, tt = 0.0, [], []
