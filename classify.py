@@ -1,20 +1,17 @@
 """
-双流网络架构（Dual-Stream）：
+架构简化：去掉MaskStream CNN，只保留面积统计特征
 
-图像流（Image Stream）：
-  EfficientNet-B0处理6通道图像 → 1280维特征
+原来：图像流(1280) + MaskCNN(128) + 面积(32) = 1440维
+现在：图像流(1280) + 面积统计(64) = 1344维
 
-Mask流（Mask Stream）：
-  轻量CNN处理4通道分割mask → 统计病变面积、位置 → 128维特征
-  同时提取手工特征：每个类别的mask面积占比（4维）
+面积统计特征包括：
+  - 4个mask的像素占比（MA/HE/EX/SE各占多少）
+  - 这4个数字直接对应DR分级标准，比CNN学出来的更稳定
+  - 不需要从头训练，不会出现数值爆炸
 
-融合层：
-  [1280 + 128 + 4] → MLP → 5分类
-
-为什么这样更好：
-  - 图像流和mask流各自用最适合的网络结构
-  - mask流专注于"有多少病变、在哪里"
-  - 面积统计特征直接对应DR分级标准（病变越多越严重）
+同时修复：
+  - freeze期间backbone的参数组从optimizer中完全移除，避免scheduler异常
+  - 解冻后重建optimizer，但用极小lr避免尖刺
 """
 
 import os
@@ -51,7 +48,7 @@ class TrainConfig:
     output_dir     = "C:/Users/Administrator/Desktop/PythonProject/cls_output"
     cache_train    = "C:/Users/Administrator/Desktop/PythonProject/cache_train_v3"
     cache_val      = "C:/Users/Administrator/Desktop/PythonProject/cache_val_v3"
-    aug_cache      = "C:/Users/Administrator/Desktop/PythonProject/cache_augmented_v4"
+    aug_cache      = "C:/Users/Administrator/Desktop/PythonProject/cache_augmented_v5"
     seg_model_path = "C:/Users/Administrator/Desktop/PythonProject/final_model_20260102_140556.pth"
 
     seg_window     = 640
@@ -60,13 +57,15 @@ class TrainConfig:
 
     num_classes    = 5
     batch_size     = 16
-    epochs         = 100
+    epochs         = 60
 
-    max_lr_img     =1e-3   # 图像流学习率
-    max_lr_mask    =5e-4   # mask流学习率（从头训练，需要更大lr）
-    weight_decay   = 2e-2
+    # 阶段1：只训练分类头（backbone冻结）
+    lr_head        = 5e-4
+    # 阶段2：解冻后极小backbone lr
+    lr_bb_finetune = 1e-5
+    weight_decay   = 1e-2
 
-    freeze_img_epochs = 9999  # 前10轮冻结图像流backbone
+    freeze_epochs  = 15   # 前15轮只训练分类头
 
     early_stop_patience = 20
     min_delta           = 1e-4
@@ -123,7 +122,7 @@ def get_seg_masks(img_rgb, model_ma, model_rest, cfg):
     pr = seg_sliding_window(model_rest, t, cfg.seg_window, cfg.seg_stride, 3, cfg.device)
     fp = torch.cat([pm, pr], dim=1)[0]
     return np.stack([(fp[i].cpu().numpy() > cfg.seg_thresholds[i]).astype(np.float32)
-                     for i in range(4)], axis=2)   # (H,W,4)
+                     for i in range(4)], axis=2)
 
 
 # ================= 预处理与缓存 =================
@@ -146,11 +145,11 @@ def make_10ch(image_bgr, size, model_ma, model_rest, cfg):
     orig_rgb = cv2.cvtColor(cv2.resize(image_bgr,(size,size)), cv2.COLOR_BGR2RGB)
     enh_rgb  = apply_clahe(ben_graham(image_bgr, size))
     full_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    masks    = get_seg_masks(full_rgb, model_ma, model_rest, cfg)   # (H,W,4)
+    masks    = get_seg_masks(full_rgb, model_ma, model_rest, cfg)
     masks_r  = cv2.resize(masks, (size,size), interpolation=cv2.INTER_NEAREST)
     ch_img   = np.concatenate([orig_rgb, enh_rgb], axis=2).astype(np.float32)
     ch_mask  = (masks_r * 255).astype(np.float32)
-    return np.concatenate([ch_img, ch_mask], axis=2).astype(np.float32)  # (s,s,10)
+    return np.concatenate([ch_img, ch_mask], axis=2).astype(np.float32)
 
 def build_cache(csv_path, img_dir, cache_dir, size, model_ma, model_rest, cfg):
     os.makedirs(cache_dir, exist_ok=True)
@@ -181,8 +180,7 @@ def build_minority_augmentation(csv_path, cache_dir, aug_dir, target, size):
         if os.path.exists(path): cls_files[label].append(path)
 
     aug_tf = A.Compose([
-        A.HorizontalFlip(p=0.5), A.VerticalFlip(p=0.5),
-        A.RandomRotate90(p=0.9),
+        A.HorizontalFlip(p=0.5), A.VerticalFlip(p=0.5), A.RandomRotate90(p=0.9),
         A.Affine(translate_percent=0.05, scale=(0.85,1.15), rotate=(-30,30), p=0.8),
         A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05, p=0.7),
     ], additional_targets={'image2':'image'})
@@ -221,50 +219,23 @@ class FocalLoss(nn.Module):
         return ((1-pt)**self.gamma * ce).mean()
 
 
-# ================= 双流网络模型 =================
-class MaskStream(nn.Module):
+# ================= 简化模型：图像流 + 面积统计特征 =================
+class FundusClassifierV2(nn.Module):
     """
-    专门处理4通道分割mask的轻量网络
-    提取病变的位置分布、密度等空间特征
-    """
-    def __init__(self, out_dim=128):
-        super().__init__()
-        self.conv = nn.Sequential(
-            # Block 1: 512→256
-            nn.Conv2d(4, 32, 3, stride=2, padding=1), nn.BatchNorm2d(32), nn.ReLU(inplace=True),
-            # Block 2: 256→128
-            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.BatchNorm2d(64), nn.ReLU(inplace=True),
-            # Block 3: 128→64
-            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
-            # Block 4: 64→32
-            nn.Conv2d(128, 256, 3, stride=2, padding=1), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
-            # Block 5: 32→16
-            nn.Conv2d(256, 256, 3, stride=2, padding=1), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
-        )
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc   = nn.Sequential(
-            nn.Linear(256, out_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.3),
-        )
+    去掉MaskStream CNN，用面积统计特征替代：
+    - 图像流：EfficientNet-B0处理6通道图像 → 1280维
+    - 面积统计：4个mask的像素占比 → 经MLP嵌入 → 64维
+    - 融合：1280+64 → 分类头
 
-    def forward(self, x):
-        feat = self.pool(self.conv(x))
-        return self.fc(torch.flatten(feat, 1))
-
-
-class DualStreamClassifier(nn.Module):
-    """
-    双流分类网络：
-    - 图像流：EfficientNet-B0处理6通道图像
-    - Mask流：轻量CNN处理4通道mask
-    - 手工特征：4个mask的面积占比（直接反映病变严重程度）
-    - 三者拼接后MLP分类
+    优势：
+    1. 无从头训练的大网络，完全避免数值爆炸
+    2. 参数量极小，不会过拟合
+    3. 面积占比直接对应DR分级标准（临床诊断依据）
     """
     def __init__(self, num_classes):
         super().__init__()
 
-        # 图像流：EfficientNet-B0，6通道输入
+        # 图像流
         base     = models.efficientnet_b0(
             weights=models.EfficientNet_B0_Weights.DEFAULT)
         old_conv = base.features[0][0]
@@ -276,56 +247,56 @@ class DualStreamClassifier(nn.Module):
         with torch.no_grad():
             new_conv.weight[:, :3] = old_conv.weight.clone()
             new_conv.weight[:, 3:] = old_conv.weight.clone()
-        base.features[0][0]  = new_conv
-        self.img_backbone    = base.features
-        self.img_pool        = base.avgpool
-        img_feat_dim         = base.classifier[1].in_features   # 1280
+        base.features[0][0] = new_conv
+        self.img_backbone   = base.features
+        self.img_pool       = base.avgpool
+        img_feat_dim        = base.classifier[1].in_features   # 1280
 
-        # Mask流：轻量CNN
-        self.mask_stream = MaskStream(out_dim=128)
-
-        # 手工特征层：面积占比 → 嵌入
-        # 4个mask各自的面积占比 = 4维
+        # 面积统计特征嵌入（4维→64维）
+        # 用两层MLP，让模型学习面积特征的非线性组合
         self.area_embed = nn.Sequential(
             nn.Linear(4, 32),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(32),
+            nn.Linear(32, 64),
             nn.ReLU(inplace=True),
         )
 
         # 融合分类头
-        fused_dim = img_feat_dim + 128 + 32
+        fused_dim = img_feat_dim + 64   # 1280 + 64 = 1344
         self.classifier = nn.Sequential(
             nn.BatchNorm1d(fused_dim),
-            nn.Dropout(p=0.5),
-            nn.Linear(fused_dim, 512),
+            nn.Dropout(p=0.45),
+            nn.Linear(fused_dim, 256),
             nn.ReLU(inplace=True),
-            nn.BatchNorm1d(512),
-            nn.Dropout(p=0.35),
-            nn.Linear(512, num_classes),
+            nn.BatchNorm1d(256),
+            nn.Dropout(p=0.3),
+            nn.Linear(256, num_classes),
         )
 
     def forward(self, img6, mask4):
-        """
-        img6:  (B, 6, H, W) - 归一化的图像特征
-        mask4: (B, 4, H, W) - 二值mask（0或1）
-        """
         # 图像流
         img_feat  = self.img_backbone(img6)
         img_feat  = self.img_pool(img_feat)
-        img_feat  = torch.flatten(img_feat, 1)     # (B, 1280)
+        img_feat  = torch.flatten(img_feat, 1)         # (B, 1280)
 
-        # Mask流
-        mask_feat = self.mask_stream(mask4)         # (B, 128)
-
-        # 手工面积特征：每个mask的像素占比
-        # 直接反映DR严重程度（MA越多越严重，EX越多越严重）
-        area = mask4.mean(dim=(2, 3))               # (B, 4)，值域[0,1]
-        area_feat = self.area_embed(area)           # (B, 32)
+        # 面积统计：每个mask的像素占比（0~1）
+        area      = mask4.mean(dim=(2, 3))             # (B, 4)
+        area_feat = self.area_embed(area)              # (B, 64)
 
         # 融合
-        fused = torch.cat([img_feat, mask_feat, area_feat], dim=1)
+        fused = torch.cat([img_feat, area_feat], dim=1)
         return self.classifier(fused)
 
-    def set_img_backbone_grad(self, requires_grad: bool):
+    def get_head_params(self):
+        """分类头 + area_embed的参数"""
+        return list(self.area_embed.parameters()) + \
+               list(self.classifier.parameters())
+
+    def get_backbone_params(self):
+        return list(self.img_backbone.parameters())
+
+    def set_backbone_grad(self, requires_grad: bool):
         for p in self.img_backbone.parameters():
             p.requires_grad = requires_grad
 
@@ -353,14 +324,14 @@ class IDRiDDataset(Dataset):
     def __len__(self): return len(self.items)
 
     def __getitem__(self, idx):
-        arr  = np.load(self.items[idx])         # (H,W,10) float32
-        ch_img  = arr[:,:,:6].astype(np.uint8)  # (H,W,6) 图像通道
-        ch_mask = arr[:,:,6:] / 255.0           # (H,W,4) mask归一化到0-1
+        arr     = np.load(self.items[idx])
+        ch_img  = arr[:,:,:6].astype(np.uint8)
+        ch_mask = arr[:,:,6:] / 255.0
 
         if self.img_transform:
             ch1 = ch_img[:,:,:3]; ch2 = ch_img[:,:,3:]
             aug = self.img_transform(image=ch1, image2=ch2)
-            t_img = torch.cat([aug['image'], aug['image2']], dim=0)  # (6,H,W)
+            t_img = torch.cat([aug['image'], aug['image2']], dim=0)
         else:
             norm  = A.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
             t_img = torch.cat([
@@ -368,7 +339,7 @@ class IDRiDDataset(Dataset):
                 torch.from_numpy(np.transpose(norm(image=ch_img[:,:,3:])['image'],(2,0,1))),
             ], dim=0)
 
-        t_mask = torch.from_numpy(np.transpose(ch_mask, (2,0,1))).float()  # (4,H,W)
+        t_mask = torch.from_numpy(np.transpose(ch_mask, (2,0,1))).float()
         return t_img, t_mask, torch.tensor(self.labels[idx], dtype=torch.long)
 
 
@@ -401,7 +372,7 @@ def get_class_weights(ds, num_classes, device):
     w   = [x/mw for x in w]
     wt  = torch.tensor(w, dtype=torch.float32).to(device)
     cnames = ['正常','轻度','中度','重度','增殖期']
-    logger.info("类别权重(sqrt自动):")
+    logger.info("类别权重:")
     for i,fw in enumerate(w): logger.info(f"  {cnames[i]}: n={c.get(i,0):>3} w={fw:.3f}")
     return wt
 
@@ -476,30 +447,26 @@ def main():
     val_loader   = DataLoader(val_ds, batch_size=cfg.batch_size,
                               shuffle=False, num_workers=4, pin_memory=True)
 
-    model     = DualStreamClassifier(cfg.num_classes).to(cfg.device)
+    model     = FundusClassifierV2(cfg.num_classes).to(cfg.device)
     cls_w     = get_class_weights(train_ds, cfg.num_classes, cfg.device)
     criterion = FocalLoss(alpha=cls_w, gamma=2.0)
 
-    # 冻结图像流backbone
-    model.set_img_backbone_grad(False)
-
-    optimizer = optim.AdamW([
-        {'params': model.img_backbone.parameters(),  'lr': cfg.max_lr_img * 0.001},
-        {'params': model.mask_stream.parameters(),   'lr': cfg.max_lr_mask},
-        {'params': model.area_embed.parameters(),    'lr': cfg.max_lr_mask},
-        {'params': model.classifier.parameters(),    'lr': cfg.max_lr_img},
-    ], weight_decay=cfg.weight_decay)
-
+    # ===== 阶段1：冻结backbone，只优化head和area_embed =====
+    model.set_backbone_grad(False)
+    optimizer = optim.AdamW(
+        model.get_head_params(),
+        lr=cfg.lr_head,
+        weight_decay=cfg.weight_decay
+    )
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr          = [cfg.max_lr_img*0.1, cfg.max_lr_mask,
-                           cfg.max_lr_mask, cfg.max_lr_img],
+        max_lr          = cfg.lr_head,
         steps_per_epoch = len(train_loader),
         epochs          = cfg.epochs,
-        pct_start       = 0.1,
+        pct_start       = 0.15,
         anneal_strategy = 'cos',
-        div_factor      = 25.0,
-        final_div_factor = 1e4,
+        div_factor      = 10.0,
+        final_div_factor = 1e3,
     )
 
     scaler   = GradScaler('cuda')
@@ -511,14 +478,28 @@ def main():
                ['train_loss','val_loss','train_qwk','val_qwk',
                 'train_acc','val_acc','lr']}
 
-    logger.info(f"设备:{cfg.device} | 双流网络 | 训练:{len(train_ds)} | 验证:{len(val_ds)}")
+    logger.info(f"设备:{cfg.device} | 简化双流(图像+面积统计) | "
+                f"训练:{len(train_ds)} | 验证:{len(val_ds)}")
+    logger.info(f"阶段1(前{cfg.freeze_epochs}轮): 只训练head+area_embed")
+    logger.info(f"阶段2(第{cfg.freeze_epochs+1}轮起): 解冻backbone，极小lr微调")
 
     for epoch in range(1, cfg.epochs+1):
 
-#        if epoch == cfg.freeze_img_epochs + 1 and not unfrozen:
-#            model.set_img_backbone_grad(True)
-#            unfrozen = True
-#            logger.info(f"Epoch{epoch}: 解冻图像流backbone")
+        # ===== 阶段2：解冻backbone，重建optimizer =====
+        if epoch == cfg.freeze_epochs + 1 and not unfrozen:
+            model.set_backbone_grad(True)
+            # 分层lr：head用当前lr继续，backbone用极小lr
+            optimizer = optim.AdamW([
+                {'params': model.get_head_params(),     'lr': cfg.lr_head * 0.1},
+                {'params': model.get_backbone_params(), 'lr': cfg.lr_bb_finetune},
+            ], weight_decay=cfg.weight_decay)
+            # 剩余轮数的CosineAnnealingLR（不用OneCycleLR避免重建问题）
+            remaining = cfg.epochs - epoch + 1
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=remaining, eta_min=1e-7)
+            unfrozen = True
+            logger.info(f"Epoch{epoch}: 解冻backbone | "
+                        f"head_lr={cfg.lr_head*0.1:.1e} bb_lr={cfg.lr_bb_finetune:.1e}")
 
         model.train()
         tl, tp, tt = 0.0, [], []
@@ -535,11 +516,16 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            # 阶段1用step级scheduler，阶段2用epoch级
+            if not unfrozen:
+                scheduler.step()
             tl += loss.item() * img6.size(0)
             _, pred = torch.max(out, 1)
-            tp.extend(pred.cpu().numpy())
-            tt.extend(labels.cpu().numpy())
+            tp.extend(pred.cpu().numpy()); tt.extend(labels.cpu().numpy())
+
+        # 阶段2 epoch级更新
+        if unfrozen:
+            scheduler.step()
 
         et_loss = tl/len(train_ds)
         et_qwk  = cohen_kappa_score(tt, tp, weights='quadratic')
@@ -557,18 +543,17 @@ def main():
                     loss = criterion(out, labels)
                 vl += loss.item() * img6.size(0)
                 _, pred = torch.max(out, 1)
-                vp.extend(pred.cpu().numpy())
-                vt.extend(labels.cpu().numpy())
+                vp.extend(pred.cpu().numpy()); vt.extend(labels.cpu().numpy())
 
         ev_loss = vl/len(val_ds)
         ev_qwk  = cohen_kappa_score(vt, vp, weights='quadratic')
         ev_acc  = np.mean(np.array(vp)==np.array(vt))
-        cur_lr  = scheduler.get_last_lr()[0]
+        cur_lr  = optimizer.param_groups[0]['lr']
 
         mild_c    = sum(1 for t,p in zip(vt,vp) if t==1 and p==1)
         mild_pred = Counter(p for t,p in zip(vt,vp) if t==1)
         logger.info(
-            f"Ep{epoch:>3} unfrz={unfrozen} lr={cur_lr:.2e} | "
+            f"Ep{epoch:>3} ph={'2' if unfrozen else '1'} lr={cur_lr:.2e} | "
             f"T qwk={et_qwk:.4f} acc={et_acc:.4f} | "
             f"V qwk={ev_qwk:.4f} acc={ev_acc:.4f} loss={ev_loss:.4f} | "
             f"轻度:{mild_c}/5 pred={dict(mild_pred)}"

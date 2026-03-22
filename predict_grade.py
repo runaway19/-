@@ -78,39 +78,22 @@ def apply_clahe(img_rgb):
 
 def prepare_inputs(image_bgr, model_ma, model_rest, device,
                     size=512, seg_thresholds=None):
-    """返回 img6 tensor(1,6,H,W) 和 mask4 tensor(1,4,H,W)"""
     orig_rgb = cv2.cvtColor(cv2.resize(image_bgr,(size,size)),cv2.COLOR_BGR2RGB)
     enh_rgb  = apply_clahe(ben_graham(image_bgr,size))
     full_rgb = cv2.cvtColor(image_bgr,cv2.COLOR_BGR2RGB)
     masks    = get_seg_masks(full_rgb,model_ma,model_rest,device,
                               thresholds=seg_thresholds)
     masks_r  = cv2.resize(masks,(size,size),interpolation=cv2.INTER_NEAREST)
-
     norm  = A.Normalize(mean=[0.485,0.456,0.406],std=[0.229,0.224,0.225])
     t1    = torch.from_numpy(np.transpose(norm(image=orig_rgb)['image'],(2,0,1))).float()
     t2    = torch.from_numpy(np.transpose(norm(image=enh_rgb)['image'],(2,0,1))).float()
-    t_img = torch.cat([t1,t2],dim=0).unsqueeze(0).to(device)   # (1,6,H,W)
-    t_msk = torch.from_numpy(np.transpose(masks_r,(2,0,1))).float().unsqueeze(0).to(device)  # (1,4,H,W)
+    t_img = torch.cat([t1,t2],dim=0).unsqueeze(0).to(device)
+    t_msk = torch.from_numpy(np.transpose(masks_r,(2,0,1))).float().unsqueeze(0).to(device)
     return t_img, t_msk
 
 
-# ================= 双流分类模型 =================
-class MaskStream(nn.Module):
-    def __init__(self, out_dim=128):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(4,32,3,stride=2,padding=1),nn.BatchNorm2d(32),nn.ReLU(inplace=True),
-            nn.Conv2d(32,64,3,stride=2,padding=1),nn.BatchNorm2d(64),nn.ReLU(inplace=True),
-            nn.Conv2d(64,128,3,stride=2,padding=1),nn.BatchNorm2d(128),nn.ReLU(inplace=True),
-            nn.Conv2d(128,256,3,stride=2,padding=1),nn.BatchNorm2d(256),nn.ReLU(inplace=True),
-            nn.Conv2d(256,256,3,stride=2,padding=1),nn.BatchNorm2d(256),nn.ReLU(inplace=True),
-        )
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc   = nn.Sequential(nn.Linear(256,out_dim),nn.ReLU(inplace=True),nn.Dropout(p=0.3))
-    def forward(self,x):
-        return self.fc(torch.flatten(self.pool(self.conv(x)),1))
-
-class DualStreamClassifier(nn.Module):
+# ================= 简化分类模型V2 =================
+class FundusClassifierV2(nn.Module):
     def __init__(self, num_classes=5, state_dict=None):
         super().__init__()
         base     = models.efficientnet_b0(weights=None)
@@ -121,22 +104,26 @@ class DualStreamClassifier(nn.Module):
         self.img_backbone = base.features
         self.img_pool     = base.avgpool
         img_feat_dim      = base.classifier[1].in_features
-        self.mask_stream  = MaskStream(out_dim=128)
-        self.area_embed   = nn.Sequential(nn.Linear(4,32),nn.ReLU(inplace=True))
-        fused_dim = img_feat_dim + 128 + 32
+
+        self.area_embed = nn.Sequential(
+            nn.Linear(4,32), nn.ReLU(inplace=True),
+            nn.BatchNorm1d(32),
+            nn.Linear(32,64), nn.ReLU(inplace=True),
+        )
+
+        fused_dim = img_feat_dim + 64
         self.classifier = nn.Sequential(
-            nn.BatchNorm1d(fused_dim),nn.Dropout(p=0.5),
-            nn.Linear(fused_dim,512),nn.ReLU(inplace=True),
-            nn.BatchNorm1d(512),nn.Dropout(p=0.35),
-            nn.Linear(512,num_classes),
+            nn.BatchNorm1d(fused_dim), nn.Dropout(p=0.45),
+            nn.Linear(fused_dim,256), nn.ReLU(inplace=True),
+            nn.BatchNorm1d(256), nn.Dropout(p=0.3),
+            nn.Linear(256,num_classes),
         )
 
     def forward(self, img6, mask4):
         img_feat  = torch.flatten(self.img_pool(self.img_backbone(img6)),1)
-        mask_feat = self.mask_stream(mask4)
         area      = mask4.mean(dim=(2,3))
         area_feat = self.area_embed(area)
-        return self.classifier(torch.cat([img_feat,mask_feat,area_feat],dim=1))
+        return self.classifier(torch.cat([img_feat,area_feat],dim=1))
 
 
 # ================= 混淆矩阵 =================
@@ -155,46 +142,33 @@ def save_confusion_matrix(y_true, y_pred, names, out_dir):
 
 # ================= TTA推理 =================
 def tta_predict(model, img6_base, mask4_base, device, n_tta=5):
-    """
-    对图像和mask同步做几何TTA
-    img6_base:  (1,6,H,W) tensor
-    mask4_base: (1,4,H,W) tensor
-    """
     probs_list = []
-
     def infer(img6, mask4):
         with torch.no_grad():
-            return torch.softmax(model(img6, mask4), dim=1)[0]
-
+            return torch.softmax(model(img6,mask4),dim=1)[0]
     probs_list.append(infer(img6_base, mask4_base))
-
-    # 对numpy做几何变换
-    img_np  = img6_base[0].cpu().numpy()    # (6,H,W)
-    mask_np = mask4_base[0].cpu().numpy()   # (4,H,W)
-
+    img_np  = img6_base[0].cpu().numpy()
+    mask_np = mask4_base[0].cpu().numpy()
     tta_ops = [
-        lambda x: np.flip(x, axis=2),                     # 水平翻转
-        lambda x: np.flip(x, axis=1),                     # 垂直翻转
-        lambda x: np.rot90(x, k=1, axes=(1,2)),           # 旋转90°
-        lambda x: np.flip(np.flip(x,axis=2),axis=1),      # 水平+垂直
+        lambda x: np.flip(x,axis=2),
+        lambda x: np.flip(x,axis=1),
+        lambda x: np.rot90(x,k=1,axes=(1,2)),
+        lambda x: np.flip(np.flip(x,axis=2),axis=1),
     ]
-
     for op in tta_ops[:n_tta-1]:
         img_aug  = torch.from_numpy(np.ascontiguousarray(op(img_np))).float().unsqueeze(0).to(device)
         mask_aug = torch.from_numpy(np.ascontiguousarray(op(mask_np))).float().unsqueeze(0).to(device)
-        probs_list.append(infer(img_aug, mask_aug))
-
+        probs_list.append(infer(img_aug,mask_aug))
     avg        = torch.stack(probs_list).mean(0)
-    conf, pred = torch.max(avg, dim=0)
+    conf, pred = torch.max(avg,dim=0)
     return pred.item(), conf.item(), avg
 
 
 # ================= 主推理 =================
 def batch_predict_with_gt(test_dir, gt_csv, cls_model_path, seg_model_path,
-                           out_dir, device, image_size=512,
-                           seg_thresholds=None):
+                           out_dir, device, image_size=512, seg_thresholds=None):
     if seg_thresholds is None: seg_thresholds=[0.4,0.5,0.5,0.4]
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(out_dir,exist_ok=True)
     cnames=['正常(0)','轻度(1)','中度(2)','重度(3)','增殖期(4)']
     cshort=['Normal','Mild','Moderate','Severe','Proliferative']
 
@@ -202,31 +176,28 @@ def batch_predict_with_gt(test_dir, gt_csv, cls_model_path, seg_model_path,
     gt_dict = dict(zip(gt_df.iloc[:,0].astype(str),gt_df.iloc[:,1].astype(int)))
 
     print("[*] 加载分割模型...")
-    model_ma, model_rest = load_seg_model(seg_model_path, device)
+    model_ma,model_rest = load_seg_model(seg_model_path,device)
 
-    sd    = torch.load(cls_model_path, map_location=device)
-    model = DualStreamClassifier(5, sd).to(device)
+    sd    = torch.load(cls_model_path,map_location=device)
+    model = FundusClassifierV2(5,sd).to(device)
     model.load_state_dict(sd)
     model.eval()
-    print(f"[*] 双流分类模型加载成功 | {device}")
+    print(f"[*] 分类模型加载成功 | {device}")
 
     imgs = sorted([f for f in os.listdir(test_dir)
                    if f.lower().endswith(('.jpg','.png','.jpeg','.tif'))])
     print(f"[*] 测试:{len(imgs)}张 | TTA:5次\n")
 
-    results, preds, targets, skip = [], [], [], 0
-    for name in tqdm(imgs, desc="推理"):
-        fid = os.path.splitext(name)[0]
+    results,preds,targets,skip=[],[],[],0
+    for name in tqdm(imgs,desc="推理"):
+        fid=os.path.splitext(name)[0]
         if fid not in gt_dict: skip+=1; continue
-        img = cv2.imread(os.path.join(test_dir,name))
+        img=cv2.imread(os.path.join(test_dir,name))
         if img is None: skip+=1; continue
-
-        img6, mask4 = prepare_inputs(img, model_ma, model_rest, device,
-                                      size=image_size,
-                                      seg_thresholds=seg_thresholds)
-        pi,cf,probs = tta_predict(model, img6, mask4, device, n_tta=5)
-        ri          = gt_dict[fid]
-        ok          = pi==ri
+        img6,mask4=prepare_inputs(img,model_ma,model_rest,device,
+                                   size=image_size,seg_thresholds=seg_thresholds)
+        pi,cf,probs=tta_predict(model,img6,mask4,device,n_tta=5)
+        ri=gt_dict[fid]; ok=pi==ri
         preds.append(pi); targets.append(ri)
         results.append({
             "文件名":name,"真实等级":ri,"预测等级":pi,
@@ -243,8 +214,8 @@ def batch_predict_with_gt(test_dir, gt_csv, cls_model_path, seg_model_path,
         pt[t]+=1
         if t==p: pc[t]+=1
 
-    pd.DataFrame(results).to_csv(
-        os.path.join(out_dir,'results.csv'),index=False,encoding='utf-8-sig')
+    pd.DataFrame(results).to_csv(os.path.join(out_dir,'results.csv'),
+                                  index=False,encoding='utf-8-sig')
     err=pd.DataFrame(results); err[err["正确"]=="✗"].to_csv(
         os.path.join(out_dir,'errors.csv'),index=False,encoding='utf-8-sig')
     save_confusion_matrix(targets,preds,cshort,out_dir)
@@ -266,7 +237,5 @@ if __name__ == "__main__":
     SEG_MDL = "C:/Users/Administrator/Desktop/PythonProject/final_model_20260102_140556.pth"
     OUT     = "C:/Users/Administrator/Desktop/PythonProject/cls_output"
     DEV     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
     batch_predict_with_gt(TEST,GT,CLS_MDL,SEG_MDL,OUT,DEV,
-                           image_size=512,
-                           seg_thresholds=[0.4,0.5,0.5,0.4])
+                           image_size=512,seg_thresholds=[0.4,0.5,0.5,0.4])
