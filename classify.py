@@ -60,13 +60,13 @@ class TrainConfig:
 
     num_classes    = 5
     batch_size     = 16
-    epochs         = 60
+    epochs         = 100
 
     max_lr_img     = 5e-4   # 图像流学习率
     max_lr_mask    = 3e-4   # mask流学习率（从头训练，需要更大lr）
     weight_decay   = 2e-2
 
-    freeze_img_epochs = 10  # 前10轮冻结图像流backbone
+    freeze_img_epochs = 15  # 前10轮冻结图像流backbone
 
     early_stop_patience = 20
     min_delta           = 1e-4
@@ -484,7 +484,7 @@ def main():
     model.set_img_backbone_grad(False)
 
     optimizer = optim.AdamW([
-        {'params': model.img_backbone.parameters(),  'lr': cfg.max_lr_img * 0.01},
+        {'params': model.img_backbone.parameters(),  'lr': cfg.max_lr_img * 0.001},
         {'params': model.mask_stream.parameters(),   'lr': cfg.max_lr_mask},
         {'params': model.area_embed.parameters(),    'lr': cfg.max_lr_mask},
         {'params': model.classifier.parameters(),    'lr': cfg.max_lr_img},
