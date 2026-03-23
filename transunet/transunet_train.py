@@ -367,14 +367,6 @@ def train_model():
             with torch.no_grad():
                 metrics = calculate_metrics(outputs, masks, threshold=0.5)
 
-            # 在训练循环中添加
-            if batch_idx == 0:
-                with torch.no_grad():
-                    print("Logits range:", outputs.min().item(), outputs.max().item())
-                    print("Sigmoid range:", torch.sigmoid(outputs).min().item(), torch.sigmoid(outputs).max().item())
-                    print("Masks sum per class:", masks.sum(dim=(0, 2, 3)))
-                    print("Positive pixels ratio:", (masks > 0).float().mean(dim=(0, 2, 3)))
-
             train_bar.set_postfix({
                 'Loss': f'{total_loss.item():.4f}',
                 'Dice': f'{metrics["dice"].mean().item():.4f}',
