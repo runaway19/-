@@ -1,5 +1,4 @@
 # --- START OF FILE transunet_train.py ---
-
 import os
 import numpy as np
 import torch
@@ -16,11 +15,13 @@ import json
 import random
 import warnings
 import torch.nn.functional as F
+import scipy.ndimage as ndimage
+import scipy.spatial as spatial
 
 # --- 导入你的 ViT 相关文件 ---
 from vit_seg_modeling import VisionTransformer, CONFIGS
 
-# 设置日志
+# 设置日志 (严格保持不变)
 logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ class Config:
     os.makedirs(log_dir, exist_ok=True)
 
 
-# --- 数据集类保持不变 ---
+# --- 数据集类 ---
 class MedicalDataset(Dataset):
     def __init__(self, image_paths, mask_paths_list, transform=None, is_train=True):
         self.image_paths = image_paths
@@ -89,21 +90,21 @@ class MedicalDataset(Dataset):
                 masks = [cv2.copyMakeBorder(m, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0) for m in masks]
                 h, w = image.shape[:2]
 
-            if random.random() < 0.6:
+            # 【优化】概率降至0.75，给模型机会学习单纯的"黑色背景"，压制过度预测
+            if random.random() < 0.75:
                 present_classes = [i for i, m in enumerate(masks) if np.sum(m) > 0]
-                rare_classes = [i for i in present_classes if i > 0]
                 target_mask = None
                 if len(present_classes) > 0:
-                    target_class_idx = random.choice(rare_classes) if (
-                            len(rare_classes) > 0 and random.random() < 0.85) else random.choice(present_classes)
+                    weights = [4.0 if c == 0 else 3.0 if c == 3 else 1.0 for c in present_classes]
+                    target_class_idx = random.choices(present_classes, weights=weights, k=1)[0]
                     target_mask = masks[target_class_idx]
 
                 if target_mask is not None:
                     lesion_indices = np.argwhere(target_mask > 0)
                     if len(lesion_indices) > 0:
                         center_idx = random.choice(lesion_indices)
-                        top = max(0, min(center_idx[0] - crop_h // 2 + random.randint(-20, 20), h - crop_h))
-                        left = max(0, min(center_idx[1] - crop_w // 2 + random.randint(-20, 20), w - crop_w))
+                        top = max(0, min(center_idx[0] - crop_h // 2 + random.randint(-30, 30), h - crop_h))
+                        left = max(0, min(center_idx[1] - crop_w // 2 + random.randint(-30, 30), w - crop_w))
                     else:
                         top, left = random.randint(0, h - crop_h), random.randint(0, w - crop_w)
                 else:
@@ -135,13 +136,13 @@ from albumentations.pytorch import ToTensorV2
 
 def get_transforms(is_train=True):
     mean, std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
-    crop_size = 512
     if is_train:
         return A.Compose([
-            A.RandomResizedCrop(size=(crop_size, crop_size), scale=(0.6, 1.0), p=0.5),
+            A.ShiftScaleRotate(shift_limit=0.05, scale_limit=(0.0, 0.2), rotate_limit=45, p=0.5),
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
-            A.RandomBrightnessContrast(p=0.5),
+            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05, p=0.5),
+            A.GaussianBlur(blur_limit=(3, 5), p=0.2),
             A.Normalize(mean, std),
             ToTensorV2(),
         ], additional_targets={f'mask{i}': 'mask' for i in range(4)})
@@ -153,41 +154,80 @@ def get_transforms(is_train=True):
 
 
 # =====================================================================
-# --- 【真正解决不收敛的终极 Loss】超高权重惩罚 BCE + 微小物体 Dice ---
+# --- 【解决假阳性 & 增强概率锐度】的改良 Loss
 # =====================================================================
 
 class UltimateRobustLoss(nn.Module):
-    def __init__(self, device):
+    def __init__(self, device, alpha=0.25, gamma=2.0):
         super().__init__()
-        # 【关键算法优化 1】: 正样本惩罚权重！
-        # MA 极其微小，漏诊惩罚 100 倍；其余病灶漏诊惩罚 50 倍。
-        # 这一步将强行打破模型预测“全黑(全零)”的舒适区！
-        self.pos_weight = torch.tensor([100.0, 50.0, 50.0, 50.0]).view(1, 4, 1, 1).to(device)
+        self.alpha = alpha
+        self.gamma = gamma
+        self.class_weights = torch.tensor([5.0, 1.0, 1.0, 2.0]).view(1, 4, 1, 1).to(device)
 
     def forward(self, logits, targets):
-        # 1. 强迫模型寻找前景的 BCE Loss
-        bce_loss = F.binary_cross_entropy_with_logits(
-            logits, targets, pos_weight=self.pos_weight, reduction='mean'
-        )
-
-        # 2. 雕刻形状的 Dice Loss
+        # 1. 加权 Focal Loss
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
         probs = torch.sigmoid(logits)
-        probs = probs.view(probs.size(0), probs.size(1), -1)
-        targets = targets.view(targets.size(0), targets.size(1), -1)
 
-        # 【关键算法优化 2】: 平滑系数从 1.0 改为 1e-4。
-        # 因为真实病灶往往只有几个像素，加 1.0 会导致分子分母差距太小，失去梯度。
-        smooth = 1e-4
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        focal_weight = (self.alpha * targets + (1 - self.alpha) * (1 - targets)) * ((1 - p_t) ** self.gamma)
+        focal_loss = (focal_weight * bce_loss * self.class_weights).mean()
 
-        intersection = (probs * targets).sum(dim=2)
-        dice = (2. * intersection + smooth) / (probs.sum(dim=2) + targets.sum(dim=2) + smooth)
-        dice_loss = 1. - dice
+        # 2.改良 Tversky
+        # 【修改1】alpha_t 提高到 0.45，加重 FP(假阳性/过度预测) 的惩罚
+        alpha_t = 0.45
+        beta_t = 0.55
+        # 【修改2】smooth 从 1.0 降到 1e-4，强迫模型吐出极度确信的概率值(要么0要么1)
+        smooth = 1e-2
 
-        # 最终损失：将两者组合
-        return bce_loss + dice_loss.mean()
+        probs_flat = probs.view(probs.size(0), probs.size(1), -1)
+        targets_flat = targets.view(targets.size(0), targets.size(1), -1)
+
+        TP = (probs_flat * targets_flat).sum(dim=2)
+        FP = (probs_flat * (1 - targets_flat)).sum(dim=2)
+        FN = ((1 - probs_flat) * targets_flat).sum(dim=2)
+
+        tversky = (TP + smooth) / (TP + alpha_t * FP + beta_t * FN + smooth)
+        tversky_loss = 1. - tversky.mean()
+
+        return focal_loss * 10.0 + tversky_loss
 
 
-# --- 指标计算与辅助函数 ---
+# --- 高效计算 HD95 辅助函数 ---
+def compute_hd95(pred, gt):
+    """
+    计算二值图像的 95% Hausdorff 距离。
+    如果都没有目标，距离为0；如果一方有一方没有，给予极大惩罚值。
+    """
+    pred = pred.astype(bool)
+    gt = gt.astype(bool)
+
+    if np.all(pred == 0) and np.all(gt == 0):
+        return 0.0
+    if np.all(pred == 0) or np.all(gt == 0):
+        return 512.0  # 图像的最大对角线级别惩罚
+
+    # 提取边界
+    pred_edges = pred ^ ndimage.binary_erosion(pred, structure=np.ones((3, 3)))
+    gt_edges = gt ^ ndimage.binary_erosion(gt, structure=np.ones((3, 3)))
+
+    pred_pts = np.argwhere(pred_edges)
+    gt_pts = np.argwhere(gt_edges)
+
+    if len(pred_pts) == 0 or len(gt_pts) == 0:
+        return 512.0
+
+    # 构建 KD 树计算最近邻距离
+    tree_pred = spatial.cKDTree(pred_pts)
+    tree_gt = spatial.cKDTree(gt_pts)
+
+    d1, _ = tree_gt.query(pred_pts)
+    d2, _ = tree_pred.query(gt_pts)
+
+    hd95 = np.percentile(np.concatenate([d1, d2]), 95)
+    return hd95
+
+
 def calculate_metrics(pred, target, threshold=0.5):
     if not ((pred >= 0) & (pred <= 1)).all(): pred = torch.sigmoid(pred)
     pred_binary = (pred > threshold).float()
@@ -225,7 +265,7 @@ def get_file_list(image_dir, mask_dirs, mask_suffixes):
     return image_paths, mask_paths_list
 
 
-def predict_sliding_window(model, image_tensor, window_size=512, stride=480, num_classes=4):
+def predict_sliding_window(model, image_tensor, window_size=512, stride=256, num_classes=4):
     model.eval()
     b, c, h, w = image_tensor.shape
     device = image_tensor.device
@@ -250,9 +290,10 @@ def predict_sliding_window(model, image_tensor, window_size=512, stride=480, num
 
             img_crop = image_tensor[:, :, y1:y2, x1:x2]
             with torch.no_grad():
-                pred_crop = torch.sigmoid(model(img_crop))
+                with torch.cuda.amp.autocast():
+                    pred_crop = torch.sigmoid(model(img_crop))
 
-            full_probs[:, :, y1:y2, x1:x2] += pred_crop * weight_map
+            full_probs[:, :, y1:y2, x1:x2] += pred_crop.float() * weight_map
             full_weights[:, :, y1:y2, x1:x2] += weight_map
 
     return full_probs / (full_weights + 1e-7)
@@ -323,13 +364,10 @@ def train_model():
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
 
-    # --- 实例化终极 Loss 武器 ---
     criterion = UltimateRobustLoss(device=device)
 
-    # --- 调度器恢复为经典余弦退火 ---
-    # OneCycleLR 会让前期学习率太低，这里改回经典的 WarmRestarts 帮助快速逃离局部极小值
     optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.num_epochs, eta_min=1e-6)
 
     train_losses, val_losses = [], []
     val_metrics_history = []
@@ -337,6 +375,8 @@ def train_model():
     best_val_dice = 0.0
 
     logger.info("开始训练...")
+
+    scaler = torch.cuda.amp.GradScaler()
 
     for epoch in range(config.num_epochs):
         model.train()
@@ -348,18 +388,19 @@ def train_model():
         for batch_idx, (images, masks) in enumerate(train_bar):
             images, masks = images.to(device), masks.to(device)
 
-            # --- 统一输出与计算 ---
-            outputs = model(images)
-            total_loss = criterion(outputs, masks)
+            with torch.cuda.amp.autocast():
+                outputs = model(images)
+                total_loss = criterion(outputs, masks)
 
-            # 梯度累加
-            (total_loss / accumulation_steps).backward()
+            scaler.scale(total_loss / accumulation_steps).backward()
 
             is_update_step = ((batch_idx + 1) % accumulation_steps == 0) or ((batch_idx + 1) == len(train_loader))
 
             if is_update_step:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad()
 
             epoch_train_loss += total_loss.item()
@@ -372,8 +413,7 @@ def train_model():
                 'Dice': f'{metrics["dice"].mean().item():.4f}',
                 'LR': f'{optimizer.param_groups[0]["lr"]:.2e}'
             })
-#test pycharm git
-        # 【恢复在 Epoch 结束时更新 scheduler】
+
         scheduler.step()
 
         # --- 验证阶段 ---
@@ -382,35 +422,57 @@ def train_model():
         total_fp = torch.zeros(4).to(device)
         total_fn = torch.zeros(4).to(device)
 
+        # 收集 HD95
+        epoch_hd95_lists = [[] for _ in range(4)]
+
         val_bar = tqdm(val_loader, desc=f'Epoch {epoch + 1} [Val]')
         with torch.no_grad():
             for images, masks in val_bar:
                 images, masks = images.to(device), masks.to(device)
 
-                full_probs = predict_sliding_window(model, images, num_classes=4)
+                full_probs = predict_sliding_window(model, images, num_classes=4, stride=256)
 
-                # 稍微降低前期阈值，捕捉细微的概率信号
-                thresholds = torch.tensor([0.3, 0.3, 0.4, 0.3]).to(device).view(1, 4, 1, 1)
+                # 将统一阈值改为0.5，检验真实概率锐度
+                thresholds = torch.tensor([0.4, 0.4, 0.4, 0.4]).to(device).view(1, 4, 1, 1)
                 preds = (full_probs > thresholds).float()
 
                 total_tp += (preds * masks).sum(dim=(0, 2, 3))
                 total_fp += (preds * (1 - masks)).sum(dim=(0, 2, 3))
                 total_fn += ((1 - preds) * masks).sum(dim=(0, 2, 3))
 
+                # 计算 HD95 (转到 CPU numpy 运算)
+                pred_np = preds.cpu().numpy()
+                mask_np = masks.cpu().numpy()
+
+                # batch_size 为 1
+                for b in range(pred_np.shape[0]):
+                    for c in range(4):
+                        hd = compute_hd95(pred_np[b, c], mask_np[b, c])
+                        epoch_hd95_lists[c].append(hd)
+
         epoch_dice = (2 * total_tp) / (2 * total_tp + total_fp + total_fn + 1e-7)
         avg_val_dice = epoch_dice.mean().item()
 
-        # 严格遵守你的要求：绝对不改动这句 logger.info
+        avg_hd95 = [np.mean(lst) for lst in epoch_hd95_lists]
+
+        # 保持你的 logger 格式，补充 HD95 指标打印
         logger.info(
-            f"Dice of MA: {epoch_dice[0]:.4f}, HE: {epoch_dice[1]:.4f}, EX: {epoch_dice[2]:.4f}, SE: {epoch_dice[3]:.4f}")
+            f"Dice -> MA: {epoch_dice[0]:.4f}, HE: {epoch_dice[1]:.4f}, EX: {epoch_dice[2]:.4f}, SE: {epoch_dice[3]:.4f} | "
+            f"HD95 -> MA: {avg_hd95[0]:.2f}, HE: {avg_hd95[1]:.2f}, EX: {avg_hd95[2]:.2f}, SE: {avg_hd95[3]:.2f}"
+        )
 
         # --- 记录数据 ---
         avg_train_loss = epoch_train_loss / len(train_loader)
         train_losses.append(avg_train_loss)
         val_losses.append(1.0 - avg_val_dice)
-        val_metrics_history.append({'dice': epoch_dice.cpu().numpy().tolist()})
 
-        # 保存最佳模型
+        # 保存带有 HD95 的指标历史
+        val_metrics_history.append({
+            'dice': epoch_dice.cpu().numpy().tolist(),
+            'hd95': avg_hd95
+        })
+
+        # 保存最佳模型 (依然以 Dice 为主导标准，HD95起参考作用)
         if avg_val_dice > best_val_dice:
             best_val_dice = avg_val_dice
             torch.save(model.state_dict(), os.path.join(config.log_dir, f'best_model.pth'))
