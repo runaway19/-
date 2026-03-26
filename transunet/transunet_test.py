@@ -427,7 +427,7 @@ def evaluate_model(model_path, config):
 if __name__ == "__main__":
     config = TestConfig()
 
-    # === 请在这里填入你训练好的模型权重文件路径 ===
-    model_path = "E:/DR_Classification/transunet/logs/vit_final_20260324_212341.pth"
+    # === 模型权重文件路径 ===
+    model_path = "E:/DR_Classification/transunet/logs/best_model.pth"
 
     evaluate_model(model_path, config)
