@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
 def seed_everything(seed=42):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -29,6 +30,7 @@ def seed_everything(seed=42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
 
 # ================= 配置类 =================
 class TrainConfig:
@@ -40,11 +42,13 @@ class TrainConfig:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     img_size = 384
     batch_size = 8
+    accumulate_steps = 4  # 【关键】梯度累加步数，8 * 4 = 等效 Batch Size 32
     epochs = 100
-    lr_backbone = 1e-5
+    lr_backbone = 1e-5  # 降低学习率，防止乱跳
     lr_head = 1e-4
     num_classes = 5
     patience = 20
+
 
 # ================= 1. 模型架构 =================
 class DeepDRTransformer(nn.Module):
@@ -59,9 +63,10 @@ class DeepDRTransformer(nn.Module):
             stride=old_conv.stride,
             padding=old_conv.padding, bias=False)
 
+        # 【核心修复】权重除以 2，保证激活值的均值和方差与预训练模型一致，彻底消除初始震荡
         with torch.no_grad():
-            new_conv.weight[:, :3] = old_conv.weight.clone()
-            new_conv.weight[:, 3:] = old_conv.weight.clone()
+            new_conv.weight[:, :3] = old_conv.weight.clone() / 2.0
+            new_conv.weight[:, 3:] = old_conv.weight.clone() / 2.0
         base.features[0][0] = new_conv
 
         self.img_backbone = base.features
@@ -79,7 +84,7 @@ class DeepDRTransformer(nn.Module):
         fused_dim = self.img_feat_dim + 64
         self.classifier = nn.Sequential(
             nn.BatchNorm1d(fused_dim),
-            nn.Dropout(p=0.4),
+            nn.Dropout(p=0.5),  # 提高 Dropout 防止小数据集过拟合
             nn.Linear(fused_dim, 256),
             nn.ReLU(inplace=True),
             nn.BatchNorm1d(256),
@@ -98,6 +103,7 @@ class DeepDRTransformer(nn.Module):
 
         fused = torch.cat([x, area_feat], dim=1)
         return self.classifier(fused)
+
 
 # ================= 2. 数据集类 =================
 class DRDataset(Dataset):
@@ -149,28 +155,37 @@ class DRDataset(Dataset):
 
         return img6, mask4, label
 
+
 # ================= 3. 训练与验证 =================
-def train_one_epoch(model, loader, optimizer, criterion, scaler, device):
+def train_one_epoch(model, loader, optimizer, criterion, scaler, device, accumulate_steps):
     model.train()
     train_loss = 0
+    optimizer.zero_grad()  # 移到循环外侧，配合梯度累加
+
     pbar = tqdm(loader, desc="Training", leave=False)
 
-    for img6, mask4, labels in pbar:
+    for i, (img6, mask4, labels) in enumerate(pbar):
         img6, mask4, labels = img6.to(device), mask4.to(device), labels.to(device)
 
-        optimizer.zero_grad()
         with autocast(device_type='cuda'):
             outputs = model(img6, mask4)
             loss = criterion(outputs, labels)
+            # 【核心】损失除以累加步数，保证梯度大小正确
+            loss = loss / accumulate_steps
 
         scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
 
-        train_loss += loss.item()
-        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+        # 达到累加步数后，执行一次更新
+        if ((i + 1) % accumulate_steps == 0) or (i + 1 == len(loader)):
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+        train_loss += loss.item() * accumulate_steps  # 还原用于打印的loss大小
+        pbar.set_postfix({"loss": f"{loss.item() * accumulate_steps:.4f}"})
 
     return train_loss / len(loader)
+
 
 @torch.no_grad()
 def validate_one_epoch(model, loader, criterion, device):
@@ -192,6 +207,7 @@ def validate_one_epoch(model, loader, criterion, device):
     qwk = cohen_kappa_score(all_labels, all_preds, weights='quadratic')
     acc = np.mean(np.array(all_preds) == np.array(all_labels))
     return val_loss / len(loader), acc, qwk
+
 
 # ================= 4. 绘图与评估 =================
 def plot_metrics(cfg, train_losses, val_losses, val_accs, val_qwks):
@@ -221,6 +237,7 @@ def plot_metrics(cfg, train_losses, val_losses, val_accs, val_qwks):
     plt.savefig(save_path, dpi=300)
     plt.close()
     logger.info(f"[*] 训练曲线已保存至: {save_path}")
+
 
 def evaluate_model(cfg, test_loader, model_path):
     logger.info("=" * 50)
@@ -252,6 +269,7 @@ def evaluate_model(cfg, test_loader, model_path):
     logger.info(f"\n混淆矩阵:\n{confusion_matrix(all_labels, all_preds)}")
     logger.info("=" * 50)
 
+
 # ================= 5. 主程序 =================
 def main():
     seed_everything(42)
@@ -264,12 +282,12 @@ def main():
     split = int(0.8 * len(df))
     train_df, val_df = df[:split], df[split:]
 
-    # 【关键回调】去掉裁剪，只用 Resize 和安全的色彩/翻转增强，保证全局病灶不丢失
+    # 保持最轻量稳定的增强
     train_tsfm = A.Compose([
         A.Resize(height=cfg.img_size, width=cfg.img_size),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
-        A.RandomBrightnessContrast(p=0.2),
+        A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=15, p=0.5),
         A.Normalize(),
         ToTensorV2()
     ])
@@ -283,22 +301,23 @@ def main():
     train_ds = DRDataset(train_df, cfg.train_img_dir, cfg.train_mask_dir, train_tsfm)
     val_ds = DRDataset(val_df, cfg.train_img_dir, cfg.train_mask_dir, val_tsfm)
 
-    # 恢复无脑的随机打乱
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     model = DeepDRTransformer(cfg.num_classes).to(cfg.device)
 
-    # 【关键回调】移除权重，找回原本有用的 Label Smoothing
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # 抛弃 Label Smoothing，使用最纯净的交叉熵，避免影响罕见类的学习
+    criterion = nn.CrossEntropyLoss()
 
+    # 加入适当的 weight_decay 防止过拟合
     optimizer = optim.AdamW([
         {'params': model.img_backbone.parameters(), 'lr': cfg.lr_backbone},
         {'params': model.area_embed.parameters(), 'lr': cfg.lr_head},
         {'params': model.classifier.parameters(), 'lr': cfg.lr_head},
-    ], weight_decay=1e-4)
+    ], weight_decay=1e-3)
 
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=1e-6)
+    # 【核心】改用更平稳的调度器：基于验证集 QWK 分数。如果连续 5 个 epoch 分数不涨，学习率减半。
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6)
     scaler = GradScaler()
 
     best_qwk = -1
@@ -309,17 +328,20 @@ def main():
 
     logger.info("[*] 开始训练...")
     for epoch in range(cfg.epochs):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler, cfg.device)
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler, cfg.device,
+                                     cfg.accumulate_steps)
         val_loss, val_acc, val_qwk = validate_one_epoch(model, val_loader, criterion, cfg.device)
 
-        scheduler.step()
+        # 调度器根据 val_qwk 自动调整
+        scheduler.step(val_qwk)
 
         history_train_loss.append(train_loss)
         history_val_loss.append(val_loss)
         history_val_acc.append(val_acc)
         history_val_qwk.append(val_qwk)
 
-        logger.info(f"Epoch [{epoch + 1}/{cfg.epochs}] | "
+        current_lr = optimizer.param_groups[0]['lr']
+        logger.info(f"Epoch [{epoch + 1}/{cfg.epochs}] | LR: {current_lr:.2e} | "
                     f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
                     f"Val Acc: {val_acc:.4f} | Val QWK: {val_qwk:.4f}")
 
@@ -338,6 +360,7 @@ def main():
 
     plot_metrics(cfg, history_train_loss, history_val_loss, history_val_acc, history_val_qwk)
     evaluate_model(cfg, val_loader, best_model_path)
+
 
 if __name__ == "__main__":
     main()
