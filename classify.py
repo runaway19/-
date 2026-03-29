@@ -40,14 +40,14 @@ class TrainConfig:
     output_dir = "C:/Users/Administrator/Desktop/PythonProject/cls_output"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    img_size = 384
+    img_size = 512
     batch_size = 8
     accumulate_steps = 4  # 【关键】梯度累加步数，8 * 4 = 等效 Batch Size 32
     epochs = 100
     lr_backbone = 1e-5  # 降低学习率，防止乱跳
     lr_head = 1e-4
     num_classes = 5
-    patience = 20
+    patience = 30
 
 
 # ================= 1. 模型架构 =================
