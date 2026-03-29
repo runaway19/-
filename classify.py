@@ -20,7 +20,6 @@ import matplotlib.pyplot as plt
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-
 def seed_everything(seed=42):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -30,7 +29,6 @@ def seed_everything(seed=42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
 
 # ================= 配置类 =================
 class TrainConfig:
@@ -46,8 +44,7 @@ class TrainConfig:
     lr_backbone = 1e-5
     lr_head = 1e-4
     num_classes = 5
-    patience = 30  # 稍微增加一点耐心
-
+    patience = 20
 
 # ================= 1. 模型架构 =================
 class DeepDRTransformer(nn.Module):
@@ -102,7 +99,6 @@ class DeepDRTransformer(nn.Module):
         fused = torch.cat([x, area_feat], dim=1)
         return self.classifier(fused)
 
-
 # ================= 2. 数据集类 =================
 class DRDataset(Dataset):
     def __init__(self, df, img_dir, mask_dir, transform=None):
@@ -153,8 +149,7 @@ class DRDataset(Dataset):
 
         return img6, mask4, label
 
-
-# ================= 3. 训练与验证核心 =================
+# ================= 3. 训练与验证 =================
 def train_one_epoch(model, loader, optimizer, criterion, scaler, device):
     model.train()
     train_loss = 0
@@ -177,7 +172,6 @@ def train_one_epoch(model, loader, optimizer, criterion, scaler, device):
 
     return train_loss / len(loader)
 
-
 @torch.no_grad()
 def validate_one_epoch(model, loader, criterion, device):
     model.eval()
@@ -199,15 +193,11 @@ def validate_one_epoch(model, loader, criterion, device):
     acc = np.mean(np.array(all_preds) == np.array(all_labels))
     return val_loss / len(loader), acc, qwk
 
-
 # ================= 4. 绘图与评估 =================
 def plot_metrics(cfg, train_losses, val_losses, val_accs, val_qwks):
-    """绘制训练曲线并保存"""
     epochs = range(1, len(train_losses) + 1)
-
     plt.figure(figsize=(15, 5))
 
-    # Loss 曲线
     plt.subplot(1, 2, 1)
     plt.plot(epochs, train_losses, 'b-', label='Train Loss')
     plt.plot(epochs, val_losses, 'r-', label='Val Loss')
@@ -217,7 +207,6 @@ def plot_metrics(cfg, train_losses, val_losses, val_accs, val_qwks):
     plt.legend()
     plt.grid(True, linestyle='--', alpha=0.7)
 
-    # 准确率和 QWK 曲线
     plt.subplot(1, 2, 2)
     plt.plot(epochs, val_accs, 'g-', label='Val Accuracy')
     plt.plot(epochs, val_qwks, 'm-', label='Val QWK')
@@ -232,7 +221,6 @@ def plot_metrics(cfg, train_losses, val_losses, val_accs, val_qwks):
     plt.savefig(save_path, dpi=300)
     plt.close()
     logger.info(f"[*] 训练曲线已保存至: {save_path}")
-
 
 def evaluate_model(cfg, test_loader, model_path):
     logger.info("=" * 50)
@@ -264,7 +252,6 @@ def evaluate_model(cfg, test_loader, model_path):
     logger.info(f"\n混淆矩阵:\n{confusion_matrix(all_labels, all_preds)}")
     logger.info("=" * 50)
 
-
 # ================= 5. 主程序 =================
 def main():
     seed_everything(42)
@@ -277,12 +264,11 @@ def main():
     split = int(0.8 * len(df))
     train_df, val_df = df[:split], df[split:]
 
-    # 稍微调小缩放比例，防止微小病灶被裁掉
+    # 【关键回调】去掉裁剪，只用 Resize 和安全的色彩/翻转增强，保证全局病灶不丢失
     train_tsfm = A.Compose([
-        A.RandomResizedCrop(size=(cfg.img_size, cfg.img_size), scale=(0.9, 1.0)),
+        A.Resize(height=cfg.img_size, width=cfg.img_size),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
-        A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=15, p=0.5),
         A.RandomBrightnessContrast(p=0.2),
         A.Normalize(),
         ToTensorV2()
@@ -297,24 +283,14 @@ def main():
     train_ds = DRDataset(train_df, cfg.train_img_dir, cfg.train_mask_dir, train_tsfm)
     val_ds = DRDataset(val_df, cfg.train_img_dir, cfg.train_mask_dir, val_tsfm)
 
-    # 恢复正常的 DataLoader（移除会引发崩溃的 Sampler，恢复 shuffle）
+    # 恢复无脑的随机打乱
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     model = DeepDRTransformer(cfg.num_classes).to(cfg.device)
 
-    # --- 核心改动：温和的类别权重损失 ---
-    train_labels = train_df['Retinopathy grade'].values
-    class_counts = np.bincount(train_labels, minlength=cfg.num_classes)
-    class_counts = np.where(class_counts == 0, 1, class_counts)
-
-    # 使用 1 / sqrt(count) 是一种更平滑的加权方式，既能照顾小类，又不会矫枉过正
-    weights = 1.0 / np.sqrt(class_counts)
-    weights = weights / np.sum(weights) * cfg.num_classes  # 归一化
-    class_weights_tensor = torch.FloatTensor(weights).to(cfg.device)
-
-    logger.info(f"[*] 使用平滑类别权重: {class_weights_tensor.cpu().numpy()}")
-    criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)  # 移除 label_smoothing
+    # 【关键回调】移除权重，找回原本有用的 Label Smoothing
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     optimizer = optim.AdamW([
         {'params': model.img_backbone.parameters(), 'lr': cfg.lr_backbone},
@@ -328,7 +304,6 @@ def main():
     best_qwk = -1
     epochs_no_improve = 0
 
-    # 记录曲线用的列表
     history_train_loss, history_val_loss = [], []
     history_val_acc, history_val_qwk = [], []
 
@@ -339,7 +314,6 @@ def main():
 
         scheduler.step()
 
-        # 记录数据用于画图
         history_train_loss.append(train_loss)
         history_val_loss.append(val_loss)
         history_val_acc.append(val_acc)
@@ -362,12 +336,8 @@ def main():
 
         torch.cuda.empty_cache()
 
-    # 绘制并保存曲线
     plot_metrics(cfg, history_train_loss, history_val_loss, history_val_acc, history_val_qwk)
-
-    # 最终评估
     evaluate_model(cfg, val_loader, best_model_path)
-
 
 if __name__ == "__main__":
     main()
