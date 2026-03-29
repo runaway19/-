@@ -13,6 +13,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from sklearn.metrics import cohen_kappa_score, classification_report, confusion_matrix
 from torch.amp import autocast, GradScaler
+import segmentation_models_pytorch as smp  # 【新增】用于加载你的分割模型
 import random
 import matplotlib.pyplot as plt
 
@@ -36,21 +37,25 @@ def seed_everything(seed=42):
 class TrainConfig:
     train_img_dir = "C:/Users/Administrator/Desktop/PythonProject/B. Disease Grading/B. Disease Grading/1. Original Images/a. Training Set"
     train_label_py = "C:/Users/Administrator/Desktop/PythonProject/B. Disease Grading/B. Disease Grading/2. Groundtruths/a. IDRiD_Disease Grading_Training Labels.csv"
-    train_mask_dir = "C:/Users/Administrator/Desktop/PythonProject/output/train_masks"
     output_dir = "C:/Users/Administrator/Desktop/PythonProject/cls_output"
 
+    # 【新增】你的分割模型权重路径
+    seg_model_path = "C:/Users/Administrator/Desktop/PythonProject/final_model_20260102_140556.pth"
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    img_size = 512
-    batch_size = 8
-    accumulate_steps = 4  # 【关键】梯度累加步数，8 * 4 = 等效 Batch Size 32
+    img_size = 384
+    # 【显存抢救】因为加载了分割模型，显存占用大增。调小真实 Batch Size，增大累加步数
+    batch_size = 4
+    accumulate_steps = 8  # 4 * 8 = 等效 Batch Size 32
+
     epochs = 100
-    lr_backbone = 1e-5  # 降低学习率，防止乱跳
+    lr_backbone = 1e-5
     lr_head = 1e-4
     num_classes = 5
     patience = 30
 
 
-# ================= 1. 模型架构 =================
+# ================= 1. 分类模型架构 =================
 class DeepDRTransformer(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
@@ -63,7 +68,6 @@ class DeepDRTransformer(nn.Module):
             stride=old_conv.stride,
             padding=old_conv.padding, bias=False)
 
-        # 【核心修复】权重除以 2，保证激活值的均值和方差与预训练模型一致，彻底消除初始震荡
         with torch.no_grad():
             new_conv.weight[:, :3] = old_conv.weight.clone() / 2.0
             new_conv.weight[:, 3:] = old_conv.weight.clone() / 2.0
@@ -84,7 +88,7 @@ class DeepDRTransformer(nn.Module):
         fused_dim = self.img_feat_dim + 64
         self.classifier = nn.Sequential(
             nn.BatchNorm1d(fused_dim),
-            nn.Dropout(p=0.5),  # 提高 Dropout 防止小数据集过拟合
+            nn.Dropout(p=0.5),
             nn.Linear(fused_dim, 256),
             nn.ReLU(inplace=True),
             nn.BatchNorm1d(256),
@@ -105,12 +109,55 @@ class DeepDRTransformer(nn.Module):
         return self.classifier(fused)
 
 
-# ================= 2. 数据集类 =================
+# ================= 2. 端到端融合管线 (核心修改区) =================
+class EndToEndPipeline(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.device = cfg.device
+
+        # 1. 加载双分割模型
+        logger.info("[*] 正在向管道注入分割模型...")
+        self.model_ma = smp.UnetPlusPlus(encoder_name="efficientnet-b4", in_channels=3, classes=1)
+        self.model_rest = smp.UnetPlusPlus(encoder_name="efficientnet-b4", in_channels=3, classes=3)
+
+        checkpoint = torch.load(cfg.seg_model_path, map_location=self.device)
+        self.model_ma.load_state_dict(checkpoint['model_ma_state'])
+        self.model_rest.load_state_dict(checkpoint['model_rest_state'])
+
+        # 【关键】彻底冻结分割模型权重，节省显存，防止被分类任务带偏
+        for param in self.model_ma.parameters(): param.requires_grad = False
+        for param in self.model_rest.parameters(): param.requires_grad = False
+        self.model_ma.eval()
+        self.model_rest.eval()
+
+        # 2. 加载分类模型
+        self.cls_model = DeepDRTransformer(cfg.num_classes)
+
+    def forward(self, img3):
+        # 步骤 1：让输入原图穿过被冻结的分割模型，生成 Mask
+        with torch.no_grad():
+            # 推理时不用管模型处于什么模式，我们只要它的特征图
+            pred_ma = torch.sigmoid(self.model_ma(img3))
+            pred_rest = torch.sigmoid(self.model_rest(img3))
+            mask4 = torch.cat([pred_ma, pred_rest], dim=1)  # (B, 4, H, W)
+
+            # 【可选阈值二值化】如果想用纯黑白掩码，可以解开下面两行注释
+            # threshold = torch.tensor([0.4, 0.5, 0.5, 0.4], device=img3.device).view(1, 4, 1, 1)
+            # mask4 = (mask4 > threshold).float()
+
+        # 步骤 2：自动拼接 6 通道
+        img_extra = mask4[:, :3, :, :]
+        img6 = torch.cat([img3, img_extra], dim=1)
+
+        # 步骤 3：喂给分类模型，只训练这里
+        return self.cls_model(img6, mask4)
+
+
+# ================= 3. 数据集类 (已简化，无需读Mask) =================
 class DRDataset(Dataset):
-    def __init__(self, df, img_dir, mask_dir, transform=None):
+    def __init__(self, df, img_dir, transform=None):
         self.df = df
         self.img_dir = img_dir
-        self.mask_dir = mask_dir
         self.transform = transform
 
     def __len__(self):
@@ -122,66 +169,53 @@ class DRDataset(Dataset):
         label = row['Retinopathy grade']
 
         img_path = os.path.join(self.img_dir, fname + ".jpg")
-        img = cv2.imread(img_path)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        image = cv2.imread(img_path)
 
-        masks = []
-        for m_type in ['MA', 'HE', 'EX', 'SE']:
-            m_path = os.path.join(self.mask_dir, f"{fname}_{m_type}.png")
-            if os.path.exists(m_path):
-                m = cv2.imread(m_path, 0)
-            else:
-                m = np.zeros(img.shape[:2], dtype=np.uint8)
-            masks.append(m)
-        mask_stack = np.stack(masks, axis=-1)
+        # 【极其重要】加入分割代码里的 CLAHE 预处理，否则你的分割模型认不出来原图！
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        merged = cv2.merge((l, a, b))
+        image_rgb = cv2.cvtColor(merged, cv2.COLOR_LAB2RGB)
 
         if self.transform:
-            augmented = self.transform(image=img, mask=mask_stack)
-            img = augmented['image']
-            mask_aug = augmented['mask']
-
-            if isinstance(mask_aug, torch.Tensor):
-                if mask_aug.ndim == 3 and mask_aug.shape[-1] == 4:
-                    mask_aug = mask_aug.permute(2, 0, 1)
-            else:
-                mask_aug = torch.from_numpy(mask_aug.transpose(2, 0, 1))
+            augmented = self.transform(image=image_rgb)
+            img_tensor = augmented['image']
         else:
-            img = torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0
-            mask_aug = torch.from_numpy(mask_stack.transpose(2, 0, 1))
+            img_tensor = torch.from_numpy(image_rgb.transpose(2, 0, 1)).float() / 255.0
 
-        mask4 = mask_aug.float() / 255.0
-        img_extra = mask4[:3, :, :]
-        img6 = torch.cat([img, img_extra], dim=0)
-
-        return img6, mask4, label
+        return img_tensor, label
 
 
-# ================= 3. 训练与验证 =================
+# ================= 4. 训练与验证 =================
 def train_one_epoch(model, loader, optimizer, criterion, scaler, device, accumulate_steps):
     model.train()
+    # 强制分割模型保持 eval 状态
+    model.model_ma.eval()
+    model.model_rest.eval()
+
     train_loss = 0
-    optimizer.zero_grad()  # 移到循环外侧，配合梯度累加
+    optimizer.zero_grad()
 
     pbar = tqdm(loader, desc="Training", leave=False)
 
-    for i, (img6, mask4, labels) in enumerate(pbar):
-        img6, mask4, labels = img6.to(device), mask4.to(device), labels.to(device)
+    for i, (img3, labels) in enumerate(pbar):
+        img3, labels = img3.to(device), labels.to(device)
 
         with autocast(device_type='cuda'):
-            outputs = model(img6, mask4)
+            outputs = model(img3)
             loss = criterion(outputs, labels)
-            # 【核心】损失除以累加步数，保证梯度大小正确
             loss = loss / accumulate_steps
 
         scaler.scale(loss).backward()
 
-        # 达到累加步数后，执行一次更新
         if ((i + 1) % accumulate_steps == 0) or (i + 1 == len(loader)):
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
 
-        train_loss += loss.item() * accumulate_steps  # 还原用于打印的loss大小
+        train_loss += loss.item() * accumulate_steps
         pbar.set_postfix({"loss": f"{loss.item() * accumulate_steps:.4f}"})
 
     return train_loss / len(loader)
@@ -193,11 +227,13 @@ def validate_one_epoch(model, loader, criterion, device):
     val_loss = 0
     all_preds, all_labels = [], []
 
-    for img6, mask4, labels in loader:
-        img6, mask4, labels = img6.to(device), mask4.to(device), labels.to(device)
+    for img3, labels in loader:
+        img3, labels = img3.to(device), labels.to(device)
 
-        outputs = model(img6, mask4)
-        loss = criterion(outputs, labels)
+        with autocast(device_type='cuda'):
+            outputs = model(img3)
+            loss = criterion(outputs, labels)
+
         val_loss += loss.item()
 
         preds = torch.argmax(outputs, dim=1)
@@ -209,7 +245,7 @@ def validate_one_epoch(model, loader, criterion, device):
     return val_loss / len(loader), acc, qwk
 
 
-# ================= 4. 绘图与评估 =================
+# ================= 5. 绘图与评估 =================
 def plot_metrics(cfg, train_losses, val_losses, val_accs, val_qwks):
     epochs = range(1, len(train_losses) + 1)
     plt.figure(figsize=(15, 5))
@@ -243,9 +279,11 @@ def evaluate_model(cfg, test_loader, model_path):
     logger.info("=" * 50)
     logger.info("[*] 正在加载最佳权重进行最终评估...")
 
-    model = DeepDRTransformer(cfg.num_classes).to(cfg.device)
+    model = EndToEndPipeline(cfg).to(cfg.device)
+
     if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=cfg.device))
+        # 我们保存的时候只存了 cls_model 的权重，所以要对应加载
+        model.cls_model.load_state_dict(torch.load(model_path, map_location=cfg.device))
     else:
         logger.error("未找到最佳模型文件！")
         return
@@ -254,9 +292,10 @@ def evaluate_model(cfg, test_loader, model_path):
     all_preds, all_labels = [], []
 
     with torch.no_grad():
-        for img6, mask4, labels in tqdm(test_loader, desc="Testing"):
-            img6, mask4 = img6.to(cfg.device), mask4.to(cfg.device)
-            outputs = model(img6, mask4)
+        for img3, labels in tqdm(test_loader, desc="Testing"):
+            img3 = img3.to(cfg.device)
+            with autocast(device_type='cuda'):
+                outputs = model(img3)
             preds = torch.argmax(outputs, dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.numpy())
@@ -270,7 +309,7 @@ def evaluate_model(cfg, test_loader, model_path):
     logger.info("=" * 50)
 
 
-# ================= 5. 主程序 =================
+# ================= 6. 主程序 =================
 def main():
     seed_everything(42)
     cfg = TrainConfig()
@@ -282,41 +321,41 @@ def main():
     split = int(0.8 * len(df))
     train_df, val_df = df[:split], df[split:]
 
-    # 保持最轻量稳定的增强
+    # 注意这里的 Normalize 必须使用预训练的 ImageNet 标准，才能让分割和分类模型都舒服
     train_tsfm = A.Compose([
         A.Resize(height=cfg.img_size, width=cfg.img_size),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=15, p=0.5),
-        A.Normalize(),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ])
 
     val_tsfm = A.Compose([
         A.Resize(height=cfg.img_size, width=cfg.img_size),
-        A.Normalize(),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ])
 
-    train_ds = DRDataset(train_df, cfg.train_img_dir, cfg.train_mask_dir, train_tsfm)
-    val_ds = DRDataset(val_df, cfg.train_img_dir, cfg.train_mask_dir, val_tsfm)
+    # 不再需要传 cfg.train_mask_dir
+    train_ds = DRDataset(train_df, cfg.train_img_dir, train_tsfm)
+    val_ds = DRDataset(val_df, cfg.train_img_dir, val_tsfm)
 
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = DeepDRTransformer(cfg.num_classes).to(cfg.device)
+    # 实例化整个管线
+    pipeline_model = EndToEndPipeline(cfg).to(cfg.device)
 
-    # 抛弃 Label Smoothing，使用最纯净的交叉熵，避免影响罕见类的学习
     criterion = nn.CrossEntropyLoss()
 
-    # 加入适当的 weight_decay 防止过拟合
+    # 【极其重要】优化器里只能放入分类模型（cls_model）的参数，分割模型参数已被冻结，不参与更新
     optimizer = optim.AdamW([
-        {'params': model.img_backbone.parameters(), 'lr': cfg.lr_backbone},
-        {'params': model.area_embed.parameters(), 'lr': cfg.lr_head},
-        {'params': model.classifier.parameters(), 'lr': cfg.lr_head},
+        {'params': pipeline_model.cls_model.img_backbone.parameters(), 'lr': cfg.lr_backbone},
+        {'params': pipeline_model.cls_model.area_embed.parameters(), 'lr': cfg.lr_head},
+        {'params': pipeline_model.cls_model.classifier.parameters(), 'lr': cfg.lr_head},
     ], weight_decay=1e-3)
 
-    # 【核心】改用更平稳的调度器：基于验证集 QWK 分数。如果连续 5 个 epoch 分数不涨，学习率减半。
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6)
     scaler = GradScaler()
 
@@ -326,13 +365,12 @@ def main():
     history_train_loss, history_val_loss = [], []
     history_val_acc, history_val_qwk = [], []
 
-    logger.info("[*] 开始训练...")
+    logger.info("[*] 端到端 (End-to-End) 训练管线启动！")
     for epoch in range(cfg.epochs):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler, cfg.device,
+        train_loss = train_one_epoch(pipeline_model, train_loader, optimizer, criterion, scaler, cfg.device,
                                      cfg.accumulate_steps)
-        val_loss, val_acc, val_qwk = validate_one_epoch(model, val_loader, criterion, cfg.device)
+        val_loss, val_acc, val_qwk = validate_one_epoch(pipeline_model, val_loader, criterion, cfg.device)
 
-        # 调度器根据 val_qwk 自动调整
         scheduler.step(val_qwk)
 
         history_train_loss.append(train_loss)
@@ -348,7 +386,8 @@ def main():
         if val_qwk > best_qwk:
             best_qwk = val_qwk
             epochs_no_improve = 0
-            torch.save(model.state_dict(), best_model_path)
+            # 只保存分类模型的权重
+            torch.save(pipeline_model.cls_model.state_dict(), best_model_path)
             logger.info(f"  [+] 更好模型已保存! 当前最佳 QWK: {best_qwk:.4f}")
         else:
             epochs_no_improve += 1
