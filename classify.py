@@ -3,7 +3,7 @@ import cv2
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader
 from torchvision import models
 import numpy as np
 import pandas as pd
@@ -14,6 +14,7 @@ from albumentations.pytorch import ToTensorV2
 from sklearn.metrics import cohen_kappa_score, classification_report, confusion_matrix
 from torch.amp import autocast, GradScaler
 import random
+import matplotlib.pyplot as plt
 
 # ================= 基础设置 =================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -33,20 +34,19 @@ def seed_everything(seed=42):
 
 # ================= 配置类 =================
 class TrainConfig:
-    # 路径配置
     train_img_dir = "C:/Users/Administrator/Desktop/PythonProject/B. Disease Grading/B. Disease Grading/1. Original Images/a. Training Set"
     train_label_py = "C:/Users/Administrator/Desktop/PythonProject/B. Disease Grading/B. Disease Grading/2. Groundtruths/a. IDRiD_Disease Grading_Training Labels.csv"
     train_mask_dir = "C:/Users/Administrator/Desktop/PythonProject/output/train_masks"
     output_dir = "C:/Users/Administrator/Desktop/PythonProject/cls_output"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    img_size = 512
+    img_size = 384
     batch_size = 8
     epochs = 100
     lr_backbone = 1e-5
     lr_head = 1e-4
     num_classes = 5
-    patience = 30
+    patience = 30  # 稍微增加一点耐心
 
 
 # ================= 1. 模型架构 =================
@@ -55,7 +55,6 @@ class DeepDRTransformer(nn.Module):
         super().__init__()
         base = models.swin_t(weights=models.Swin_T_Weights.DEFAULT)
 
-        # 修改第一层
         old_conv = base.features[0][0]
         new_conv = nn.Conv2d(
             6, old_conv.out_channels,
@@ -93,7 +92,7 @@ class DeepDRTransformer(nn.Module):
     def forward(self, img6, mask4):
         x = self.img_backbone(img6)
         if x.dim() == 4:
-            x = x.permute(0, 3, 1, 2)  # Swin Transformer 输出通常是 [B, H, W, C]
+            x = x.permute(0, 3, 1, 2)
             x = self.img_pool(x)
         x = torch.flatten(x, 1)
 
@@ -139,7 +138,6 @@ class DRDataset(Dataset):
             img = augmented['image']
             mask_aug = augmented['mask']
 
-            # 维度兼容性处理
             if isinstance(mask_aug, torch.Tensor):
                 if mask_aug.ndim == 3 and mask_aug.shape[-1] == 4:
                     mask_aug = mask_aug.permute(2, 0, 1)
@@ -202,7 +200,40 @@ def validate_one_epoch(model, loader, criterion, device):
     return val_loss / len(loader), acc, qwk
 
 
-# ================= 4. 评估函数 =================
+# ================= 4. 绘图与评估 =================
+def plot_metrics(cfg, train_losses, val_losses, val_accs, val_qwks):
+    """绘制训练曲线并保存"""
+    epochs = range(1, len(train_losses) + 1)
+
+    plt.figure(figsize=(15, 5))
+
+    # Loss 曲线
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, train_losses, 'b-', label='Train Loss')
+    plt.plot(epochs, val_losses, 'r-', label='Val Loss')
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+
+    # 准确率和 QWK 曲线
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, val_accs, 'g-', label='Val Accuracy')
+    plt.plot(epochs, val_qwks, 'm-', label='Val QWK')
+    plt.title('Validation Accuracy & QWK')
+    plt.xlabel('Epochs')
+    plt.ylabel('Score')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+
+    plt.tight_layout()
+    save_path = os.path.join(cfg.output_dir, 'training_curves.png')
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    logger.info(f"[*] 训练曲线已保存至: {save_path}")
+
+
 def evaluate_model(cfg, test_loader, model_path):
     logger.info("=" * 50)
     logger.info("[*] 正在加载最佳权重进行最终评估...")
@@ -246,9 +277,9 @@ def main():
     split = int(0.8 * len(df))
     train_df, val_df = df[:split], df[split:]
 
-    # 【注意】修复了 RandomResizedCrop 和 Resize 的参数传递方式
+    # 稍微调小缩放比例，防止微小病灶被裁掉
     train_tsfm = A.Compose([
-        A.RandomResizedCrop(size=(cfg.img_size, cfg.img_size), scale=(0.85, 1.0)),
+        A.RandomResizedCrop(size=(cfg.img_size, cfg.img_size), scale=(0.9, 1.0)),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=15, p=0.5),
@@ -266,26 +297,24 @@ def main():
     train_ds = DRDataset(train_df, cfg.train_img_dir, cfg.train_mask_dir, train_tsfm)
     val_ds = DRDataset(val_df, cfg.train_img_dir, cfg.train_mask_dir, val_tsfm)
 
-    # 类别权重采样器
-    train_labels = train_df['Retinopathy grade'].values
-    class_counts = np.bincount(train_labels, minlength=cfg.num_classes)
-    class_counts = np.where(class_counts == 0, 1, class_counts)
-    class_weights = 1.0 / class_counts
-    sample_weights = class_weights[train_labels]
-
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(sample_weights),
-        replacement=True
-    )
-
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, sampler=sampler, num_workers=4, pin_memory=True)
+    # 恢复正常的 DataLoader（移除会引发崩溃的 Sampler，恢复 shuffle）
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     model = DeepDRTransformer(cfg.num_classes).to(cfg.device)
 
-    # 标签平滑交叉熵
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # --- 核心改动：温和的类别权重损失 ---
+    train_labels = train_df['Retinopathy grade'].values
+    class_counts = np.bincount(train_labels, minlength=cfg.num_classes)
+    class_counts = np.where(class_counts == 0, 1, class_counts)
+
+    # 使用 1 / sqrt(count) 是一种更平滑的加权方式，既能照顾小类，又不会矫枉过正
+    weights = 1.0 / np.sqrt(class_counts)
+    weights = weights / np.sum(weights) * cfg.num_classes  # 归一化
+    class_weights_tensor = torch.FloatTensor(weights).to(cfg.device)
+
+    logger.info(f"[*] 使用平滑类别权重: {class_weights_tensor.cpu().numpy()}")
+    criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)  # 移除 label_smoothing
 
     optimizer = optim.AdamW([
         {'params': model.img_backbone.parameters(), 'lr': cfg.lr_backbone},
@@ -299,6 +328,10 @@ def main():
     best_qwk = -1
     epochs_no_improve = 0
 
+    # 记录曲线用的列表
+    history_train_loss, history_val_loss = [], []
+    history_val_acc, history_val_qwk = [], []
+
     logger.info("[*] 开始训练...")
     for epoch in range(cfg.epochs):
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler, cfg.device)
@@ -306,8 +339,15 @@ def main():
 
         scheduler.step()
 
-        logger.info(f"Epoch [{epoch + 1}/{cfg.epochs}] | LR: {optimizer.param_groups[1]['lr']:.2e} | "
-                    f"Train Loss: {train_loss:.4f} | Val QWK: {val_qwk:.4f}")
+        # 记录数据用于画图
+        history_train_loss.append(train_loss)
+        history_val_loss.append(val_loss)
+        history_val_acc.append(val_acc)
+        history_val_qwk.append(val_qwk)
+
+        logger.info(f"Epoch [{epoch + 1}/{cfg.epochs}] | "
+                    f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+                    f"Val Acc: {val_acc:.4f} | Val QWK: {val_qwk:.4f}")
 
         if val_qwk > best_qwk:
             best_qwk = val_qwk
@@ -321,6 +361,9 @@ def main():
                 break
 
         torch.cuda.empty_cache()
+
+    # 绘制并保存曲线
+    plot_metrics(cfg, history_train_loss, history_val_loss, history_val_acc, history_val_qwk)
 
     # 最终评估
     evaluate_model(cfg, val_loader, best_model_path)
