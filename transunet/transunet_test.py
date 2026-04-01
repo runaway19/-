@@ -325,8 +325,8 @@ def evaluate_model(model_path, config):
     vit_config.patches.grid = (config.crop_size // 16, config.crop_size // 16)
     model = VisionTransformer(vit_config, img_size=config.crop_size, num_classes=config.num_classes).to(device)
 
-    # 加载你的训练权重
-    checkpoint = torch.load(model_path, map_location=device)
+    # 加载训练权重
+    checkpoint = torch.load(model_path, map_location=device,weights_only=False)    #加了'weights_only=False'
     # 如果保存的是整个 state_dict，直接 load；如果是字典包含 'model_state' 则取内部值
     if 'model_state' in checkpoint:
         model.load_state_dict(checkpoint['model_state'])
@@ -428,6 +428,6 @@ if __name__ == "__main__":
     config = TestConfig()
 
     # === 模型权重文件路径 ===
-    model_path = "E:/DR_Classification/transunet/logs/best_model.pth"
+    model_path = "E:/DR_Classification/transunet/logs/vit_final_20260324_212341.pth"
 
     evaluate_model(model_path, config)
