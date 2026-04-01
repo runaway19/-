@@ -55,6 +55,32 @@ class TrainConfig:
     patience = 30
 
 
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+        # 将 alpha 转换为 tensor
+        if alpha is not None:
+            self.alpha = torch.tensor(alpha, dtype=torch.float32)
+        else:
+            self.alpha = None
+
+    def forward(self, inputs, targets):
+        ce_loss = nn.functional.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+
+        if self.alpha is not None:
+            alpha_t = self.alpha.to(targets.device).gather(0, targets)
+            focal_loss = alpha_t * focal_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
+
 # ================= 1. 分类模型架构 =================
 class DeepDRTransformer(nn.Module):
     def __init__(self, num_classes):
@@ -347,7 +373,8 @@ def main():
     # 实例化整个管线
     pipeline_model = EndToEndPipeline(cfg).to(cfg.device)
 
-    criterion = nn.CrossEntropyLoss()
+    alpha_weights = [1.0, 8.0, 0.8, 1.5, 3.0]  # 结合权重使用效果更好
+    criterion = FocalLoss(alpha=alpha_weights, gamma=2.0)
 
     # 【极其重要】优化器里只能放入分类模型（cls_model）的参数，分割模型参数已被冻结，不参与更新
     optimizer = optim.AdamW([
